@@ -1,0 +1,527 @@
+#!/bin/bash
+
+#
+# arkoon-parser : this application parses arkoon's rulebase stored in akx files and extracts firewalling rules from it
+#
+
+# Creator : EPI / TGS / TGS / NDU
+# Date : Jan 2017
+# Version : 0.1
+
+# Change logs :
+# - 24/01/2017 : date of creation
+#
+
+#
+# Environment variables
+#
+DATE=$(date '+%d%m%Y%H%M%S')
+TMPDIR=/tmp
+TMPFILE=$TMPDIR/arkoon-parser.tmp
+verbosemode=0
+csvouput=0
+
+
+# Colors
+#
+BLUE=$(echo -e '\e[0;36m')
+WHITE=$(echo -e '\e[0m')
+RED=$(echo -e '\e[1;31m')
+GREEN=$(echo -e '\e[1;32m')
+YELLOW=$(echo -e '\e[1;33m')
+
+
+#
+# Functions
+#
+usage () {
+	echo ${RED}
+	cat <<EOF
+USAGE : $0 [ -dv ] [ -l ] [ -r ] [ -c XML config file ] [ -o object name ] [ -f filter args ] [ -F CSV output file ]
+
+	Description : $0 parses arkoon's akx files and extracts firewalling rules or object's properties from it
+1
+	Options :
+	-h : help
+	-d : debug mode ON
+	-v : verbose mode ON
+	-F : results print out into CVS file
+	-c : AKS configuration file to be analysed (XML file)
+	-l : list objects
+	-o : Object name (Host, Network, Service, Rule... can be used with -f option) 
+	-f : filter arguments (format : paramter="value") 
+	-r : print firewall rules (can be used with -f option)
+EOF
+	echo ${WHITE}
+	exit 1
+}
+
+
+#
+# cleanconf : clean up xml input file to get the analyze process easier
+#
+cleanconf () {
+
+	xmlfile=$1
+
+	# Erases spaces and tabs before tags and separates "glued" tags
+	#
+	sed 's/\t//g ; s/^ *</</g ; s/></>\n</g ; /^ *$/d' $xmlfile >$TMPFILE.cleanconf
+}
+
+
+#
+# xmltaglist : list every single XML tag/object featured in XML configuration file
+#
+xmltaglist () {
+	configfile=$1
+
+	[ -z "$configfile" ] && echo "XML configuration file missing !" && exit 1
+
+	grep "</.*>$" $configfile | egrep -v " |<[a-zA-Z]" | sed 's/\t//g ; s/></>\n</g ; s/\///g ; s/[<>]//g' | sort -u
+	echo && exit 0
+
+}
+
+
+#
+# xmltagprint : prints out tag's content
+#
+# input data : [tag's original line number]: [Tag name, parameters and values]
+#
+xmltagprint () {
+	filteredxmlfile=$1
+
+	rm $TMPFILE.xmltagprint.* 2>/dev/null
+
+	while read line ; do
+
+		# For each line, isolate tag's location and name
+		#
+		linenumber=$(echo $line | awk '{print $1}' | cut -d: -f1)
+		tagname=$(echo $line | sed 's/[<>]/ /g' | awk '{print $2}')
+
+
+		# Define tag's beginning and end line number
+		#
+
+		# Are both tags on the same line ?
+		#
+		echo $line | grep -q "$tagname.*/$tagname"
+
+		# If so, does filter match ? if it does, print the specific entry or print it all out
+		#
+		if [ $? -eq 0 ] ; then
+			if [ -n "$paramtag" ] && [ -n "$paramvalue" ] ; then
+				sed -n "$linenumber,${linenumber}p" $TMPFILE.cleanconf | grep -q "${paramtag}>$paramvalue<"
+
+				if [ $? -eq 0 ] ; then
+					sed -n "$linenumber,${linenumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  / /g' | tee -a $TMPFILE.xmltagprint.$startnumber
+					break
+				fi
+			else
+				sed -n "$linenumber,${linenumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  / /g' | tee -a $TMPFILE.xmltagprint.$startnumber
+			fi
+
+		fi 
+
+		# If not,
+		#
+		if [ "$tagname" = "$searchedtag" ] ; then
+			startnumber=$linenumber
+
+		elif [ "$tagname" = "/$searchedtag" ] ; then
+			endnumber=$linenumber
+		fi
+
+		# If both tags are found and if there's a line number associated, print out what's in between
+		#
+		if [ -n "$startnumber" ] && [ -n "$endnumber" ] ; then  
+
+			if [ "$startnumber" -gt 0 ] && [ "$endnumber" -gt 0 ] ; then 
+
+				# If we're looking for a particular parameter tag and value, let's filter 'em out
+				# Tag's parameters can be found two different ways
+				#
+				if [ -n "$paramtag" ] && [ -n "$paramvalue" ] ; then
+					sed -n "$startnumber,${endnumber}p" $TMPFILE.cleanconf | grep -q "${paramtag}[>=]$paramvalue<"
+
+					if [ $? -eq 0 ] ; then
+						sed -n "$startnumber,${endnumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  / /g' | tee -a $TMPFILE.xmltagprint.$startnumber
+						echo 
+
+						# Reset first and last tag's line number
+						#
+						startnumber=''
+						endnumber=''
+						
+						break
+					fi
+				else
+					# if we don't what to look for, print all out 
+					#
+					sed -n "$startnumber,${endnumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  / /g' | tee -a $TMPFILE.xmltagprint.$startnumber
+					echo 
+
+					# Reset first and last tag's line number
+					#
+					startnumber=''
+					endnumber=''
+
+				fi
+				
+			else
+				echo "Parsing error at line $linenumber" && exit 1
+			fi
+		fi
+
+	done < $filteredxmlfile
+}
+
+
+#
+# xmltagsearch : look for specific XML tag and show its content. Can be used filtered out using an XML parameter/value
+#
+xmltagsearch () {
+	xmlfile=$1
+	searchedtag=$2
+	paramtag=$3
+	paramvalue=$4
+
+	# Deletes previous saved data
+	#
+	[ -r $TMPFILE.xmltagsearch ] && rm $TMPFILE.xmltagsearch
+
+	# Locate and save every occurence of first and possibly last xml tags for the searched tag
+	#
+	egrep -n "<${searchedtag}[ >]|</$searchedtag>" $TMPFILE.cleanconf > $TMPFILE.xmltagsearch
+
+	# Does it exist ?
+	# 
+	[ ! -s $TMPFILE.xmltagsearch ] && echo "Tag \"$searchedtag\" not found !!!" && exit 1
+
+	# What kind of tag is it : structure tag or tag with parameters ?
+	# 	- Structure tag : start and end tag on different lines AND without paremeter/value
+	#	- Parameter tag : 
+	#		start and end tag on the same line AND contains a value
+	#		tag ends with />
+	#		tag's content with at least one space character
+	#
+	grep -q "/>" $TMPFILE.xmltagsearch && tagtype='parameter'
+	grep -q " " $TMPFILE.xmltagsearch && tagtype='parameter'
+	grep -q "<.*>.*</.*>" $TMPFILE.xmltagsearch && tagtype='parameter'
+
+	[ ! "$tagtype" = 'parameter' ]  && tagtype='structure'
+
+
+	# If tag type is structure, show its whole content and look for a specific parameter tag and show its value
+	#
+	if [ "$tagtype" = 'structure' ] ; then
+
+		xmltagprint $TMPFILE.xmltagsearch
+	else
+		# If the searched xml tag contains parameters, lets see it we can speed up search process with a 
+		# given tag parameter and its value
+		#
+
+		if [ -n "$paramtag" ] && [ -n "$paramvalue" ] ; then
+
+			# doest filter match somthing ?
+			#
+			grep -q "${paramtag}=\"$paramvalue\"" $TMPFILE.xmltagsearch
+
+			if [ $? -eq 0 ] ; then
+				startnumber=$(grep "${paramtag}[>=]\"$paramvalue\"" $TMPFILE.xmltagsearch | tail -1 | cut -d':' -f1)
+				endnumber=$(grep -A1 "${paramtag}[>=]\"$paramvalue\"" $TMPFILE.xmltagsearch | tail -1 | cut -d':' -f1)
+
+				if [ -n "$startnumber" ] && [ -n "$endnumber" ] ; then
+					sed -n "$startnumber,${endnumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  //g'
+					echo && return 0
+				fi
+			fi
+
+			grep -q "${paramtag}>${paramvalue}<" $TMPFILE.xmltagsearch
+
+
+			if [ $? -eq 0 ] ; then
+				startnumber=$(grep "${paramtag}>$paramvalue<" $TMPFILE.xmltagsearch | tail -1 | cut -d':' -f1)
+				endnumber=$(grep -A1 "${paramtag}>${paramvalue}<" $TMPFILE.xmltagsearch | tail -1 | cut -d':' -f1)
+
+				if [ -n "$startnumber" ] && [ -n "$endnumber" ] ; then
+					sed -n "$startnumber,${endnumber}{=;p}" $TMPFILE.cleanconf | sed '{N;s/\n/ /}' | sed 's/  //g'
+					echo && return 0
+				fi
+			else
+
+				#echo "$paramtag($paramvalue) not found !" && exit 1
+				# If nothing has been found
+				#
+				xmltagprint $TMPFILE.xmltagsearch
+			fi
+		else
+
+			# if there's only a tag, lets print out every tags... what's the point there ?
+			#
+			xmltagprint $TMPFILE.xmltagsearch
+			
+		fi
+	fi
+
+}
+
+# Resolves references for a chosen object type to a humanly understandable value (only for Arkoon)
+#
+refresolver () {
+	rulefile=$1
+	tagname=$2
+
+	while read line ; do
+
+		# Lets find out every reference name which is not humanly understandable
+		#
+		refname=$(echo "$line" | grep "<${tagname} " | cut -d' ' -f3 | cut -d"=" -f2 | sed 's/"/\\"/g')
+
+		# If found, lets figure out its type (host, network, service) and its real name
+		#
+		if [ ! -z "$refname" ] ; then
+		
+			tag=$(grep "Guid=$refname" $TMPFILE.cleanconf | awk '{print $1}' | sed 's/<//g')
+			paramname=$(grep "Guid=$refname" $TMPFILE.cleanconf | sed 's/\" /\n/g ; s/\"//g' | grep Name | cut -d'=' -f2)
+
+			if [ "$verbosemode" -eq 1 ] ; then
+
+				# With its name, lets figure out its IP address or service port
+				#
+				if [ "$tag" = 'Host' ] ; then
+					ipaddress=$(xmltagsearch $configfile $tag Name "$paramname" | egrep "Ip " | cut -d'"' -f2) 
+					ipaddress=$(dec2ip $ipaddress)
+		
+					echo "$tag : $paramname ($ipaddress/32)"
+
+				elif  [ "$tag" = 'Network' ] ; then
+					ipaddress=$(xmltagsearch $configfile $tag Name "$paramname" | egrep "Address " | cut -d'"' -f2)
+					ipaddress=$(dec2ip $ipaddress)
+					ipmask=$(xmltagsearch $configfile $tag Name "$paramname" | egrep "Address " | cut -d'"' -f4)
+
+					echo "$tag : $paramname ($ipaddress/$ipmask)"
+
+				elif [ "$tag" = 'ServiceUserTcp' ] || [ "$tag" = 'ServiceUserUdp' ] ; then
+					portnumber=$(xmltagsearch $configfile $tag Name "$paramname" | egrep "Port " | cut -d'"' -f2)
+					endportnumber=$(xmltagsearch $configfile $tag Name "$paramname" | egrep "Port " | cut -d'"' -f4)
+	
+					if [ "$portnumber" -ne "$endportnumber" ] ; then
+						[ "$tag" = 'ServiceUserTcp' ] && echo "$tag : $paramname (tcp_${endportnumber}-${portnumber})"
+						[ "$tag" = 'ServiceUserUdp' ] && echo "$tag : $paramname (udp_${endportnumber}-${portnumber})"
+					else
+						[ "$tag" = 'ServiceUserTcp' ] && echo "$tag : $paramname (tcp_${portnumber})"
+						[ "$tag" = 'ServiceUserUdp' ] && echo "$tag : $paramname (udp_${portnumber})"
+					
+					fi
+				fi
+			else
+				echo "$tag : "$paramname""
+			fi	
+		fi
+
+	done < $rulefile
+
+	echo
+}
+
+
+csvexporter () {
+	for line in $(cat $1 | cut -d' ' -f3- | sed 's/[()]//g ; s/ /,/g') ; do
+		echo "$line" 
+	done | tr '\n' ' '
+
+	echo
+}
+
+#
+# ruleanalyze : processes file containing XML datas for a single firewall rule, save it to CSV file if needed and prints it out
+#
+ruleanalyze () {
+	rulefile=$1
+
+	rm $TMPFILE.ruleanalyze.* 2>/dev/null
+
+	# Rule's basic info
+	#
+	rulenumber=$(grep '<SeqNum>' $rulefile | cut -d'>' -f2 | cut -d'<' -f1)
+	rulename=$(grep '<Rule Name' $rulefile | cut -d'"' -f2)
+	rulestatus=$(grep '<General Activated=' $rulefile | cut -d'"' -f2)
+	[ "$rulestatus" = '1' ] && rulestatus='true'
+	ruleaction=$(egrep "<Block |<Reject |<Accept" $rulefile | grep 'true' | awk '{print $2}' | sed 's/<//g')
+	rulelog=$(grep '<Log>' $rulefile | cut -d'>' -f2 | cut -d'<' -f1)
+
+	if [ -z "$outputfile" ] ; then
+		[ "$rulestatus" = 'true' ] && rulestatus="${GREEN}Enabled${WHITE}" || rulestatus="${RED}Disabled${WHITE}"
+		[ "$ruleaction" = 'Accept' ] && ruleaction="${GREEN}${ruleaction}${WHITE}" || ruleaction="${RED}${ruleaction}${WHITE}"
+		[ "$rulelog" = 'Nothing' ] && rulelog="${RED}$rulelog${WHITE}" || rulelog="${GREEN}$rulelog${WHITE}"
+
+		echo "${RED}Rule's basic informations :${WHITE}"
+		echo "Rule number : $rulenumber"
+		echo "Rule name : $rulename"
+		echo "Status : $rulestatus"
+		echo "Action : $ruleaction"
+		echo -e "Log level : $rulelog\n"
+
+	else
+		[ "$rulestatus" = 'true' ] && rulestatus="Enabled" || rulestatus="Disabled"
+	fi
+
+	for object in Source Destination Service ; do
+		if [ ! -z "$outputfile" ] ; then
+			data=$(refresolver $rulefile $object | csvexporter)
+
+			for name in $(echo "$data") ; do
+				echo "$name" | cut -d',' -f1 >>$TMPFILE.ruleanalyze.$object.name
+			done
+
+			for value in $(echo "$data") ; do
+				echo "$value" | cut -d',' -f2 >>$TMPFILE.ruleanalyze.$object.value
+			done
+
+			if [ "$object" = 'Source' ] ; then
+				srcname=$(cat $TMPFILE.ruleanalyze.Source.name 2>/dev/null | tr '\n' ' ')
+				srcaddress=$(cat $TMPFILE.ruleanalyze.Source.value 2>/dev/null | tr '\n' ' ')
+
+			elif [ "$object" = 'Destination' ] ; then
+				dstname=$(cat $TMPFILE.ruleanalyze.Destination.name 2>/dev/null | tr '\n' ' ')
+				dstaddress=$(cat $TMPFILE.ruleanalyze.Destination.value 2>/dev/null | tr '\n' ' ')
+			else
+				dstportname=$(cat $TMPFILE.ruleanalyze.Service.value 2>/dev/null | tr '\n' ' ')
+			fi
+		else
+			echo "${RED}$object objet(s) :${WHITE}"
+
+			refresolver $rulefile $object
+		fi
+
+	done
+
+	# prints out and save rules using CSV format
+	#
+	if [ ! -z "$outputfile" ] ; then
+	 	echo -e "$rulenumber,$appname,$rulename,$srczone,$srcname,$srcaddress,$dstzone,$dstname,$dstaddress,$dstportname,$ruleaction,,$rulelog,$rulestatus"
+	fi
+
+	# To be done : translated source and destination objects
+	#
+
+
+}
+
+
+#
+# ruleprint : print out every firewall rules onto standard output or into CSV file
+#
+ruleprint () {
+	xmlfile=$1
+
+	rm $TMPFILE.xmltagprint.*.ruleprint 2>/dev/null
+	rm $TMPFILE.ruleprint 2>/dev/null
+
+	echo -e "\nArkoon firewall rules extraction : processing ${GREEN}$xmlfile...${WHITE}" | tee -a $TMPFILE.ruleprint
+
+	extractiontime=$( (time xmltagsearch $configfile Rule > $TMPFILE.rules) 2>&1 | grep '^real' | awk '{print $2}')
+	rulecount=$(ls $TMPFILE.xmltagprint.* | wc -l)
+
+	echo "Arkoon firewall rules extraction : ${RED}Done. ${GREEN}$rulecount${WHITE} rules have been extracted in $extractiontime." | tee -a $TMPFILE.ruleprint
+	echo "Arkoon firewall rules extraction : analyzing rules..." | tee -a $TMPFILE.ruleprint
+
+	if [ "$function" = 'rulesearch' ] ; then
+	 	echo -e "rulenumber,appname,rulename,srczone,srcname,srcaddress,dstzone,dstname,dstaddress,dstportname,ruleaction,adminaction,rulelog,comment" >$outputfile
+
+		for rulefile in $(ls $TMPFILE.xmltagprint.*) ; do
+			ruleanalyze $rulefile | tee -a $outputfile
+		done
+	fi
+
+	echo "Arkoon firewall rules extraction : Finished." | tee -a $TMPFILE.ruleprint
+
+}
+
+
+#
+# rulesearch : search for a specific rule using a single xml parameter and value ( -r 'parameter=value' ) and analyze it
+#
+rulesearch () {
+	xmlfile=$1
+	rulearg=$2
+
+	xmltag=$(echo $rulearg | cut -d'=' -f1)
+	tagvalue=$(echo $rulearg | cut -d'=' -f2)
+
+	if [ -z "$xmltag" ] || [ -z "$tagvalue" ] ; then
+		echo "Invalid search parameter or value" && exit 1
+	fi
+
+	xmltagsearch $configfile Rule $xmltag $tagvalue > $TMPFILE.rules
+
+	if [ ! -z "$outputfile" ] ; then
+	 	echo -e "rulenumber,appname,rulename,srczone,srcname,srcaddress,dstzone,dstname,dstaddress,dstportname,ruleaction,adminaction,rulelog,comment" >$outputfile
+		ruleanalyze $TMPFILE.rules >>$outputfile
+	else
+		ruleanalyze $TMPFILE.rules
+	fi
+}
+	
+
+#
+# ip2dec : convert decimal value to IP adadress
+#
+dec2ip () {
+	local ip dec=$@
+	
+	for e in {3..0} ; do
+		((octet = dec / (256 ** e) ))
+		((dec -= octet * 256 ** e))
+		ip+=$delim$octet
+		delim=.
+	done
+
+	printf '%s\n' "$ip"
+}
+
+
+#
+# Main function
+#
+
+[ -z $1 ] && usage
+
+while getopts "hdvc:lo:rf:F:" OPT ; do
+        case $OPT in
+                d) set -x ;;
+                h) usage;;
+		v) verbosemode=1 ;;
+		F) outputfile=$OPTARG ;; 
+                c) configfile=$OPTARG ;;
+		l) xmltaglist $configfile ;;
+		o) tag=$OPTARG ;;
+		f) filter=$OPTARG ;;
+		r) function="rulesearch" ;;
+        esac
+done
+shift $(expr $OPTIND - 1)
+
+[ ! -r "$configfile" ] && echo "AKS file is missing!!" && exit 1
+
+
+cleanconf $configfile
+
+if [ -n "$tag" ] ; then
+
+	if [ -n "$filter" ] ; then
+		tagparam=$(echo $filter | cut -d'=' -f1)
+		paramvalue=$(echo $filter | cut -d'=' -f2)
+
+		xmltagsearch "$configfile" "$tag" "$tagparam" "$paramvalue"
+	else
+		xmltagsearch "$configfile" "$tag"
+	fi
+fi
+
+[ "$function" = 'rulesearch' ] && [ ! -z "$filter" ] && rulesearch "$configfile" "$filter"
+[ "$function" = 'rulesearch' ] && [ -z "$filter" ] && ruleprint "$configfile" 
